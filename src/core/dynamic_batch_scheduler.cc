@@ -49,7 +49,7 @@ std::vector<unsigned int> up;
 std::vector<unsigned int> down;
 unsigned int su;
 unsigned int sd;
-
+double alpha = 0;
 int count = 0;
 
 namespace nvidia { namespace inferenceserver {
@@ -83,23 +83,24 @@ DynamicBatchScheduler::DynamicBatchScheduler(
         std::max(max_preferred_batch_size_, (size_t)size);
   }
 
-  //(RYU) Get device handler
-  for (int didx = 0; didx < (int)scheduler_thread_cnt_+1; didx ++) { // Becuase RTX1 server config..
-    char pcibusid_str[64]; 
+  // Get device handler
+  nvmlReturn_t nvmlerr;
+  for (int didx = 0; didx < (int)scheduler_thread_cnt_+1; didx ++) {
+    char pcibusid_str[64];
     cudaError_t cudaerr =
         cudaDeviceGetPCIBusId(pcibusid_str, sizeof(pcibusid_str) - 1, didx);
     if (cudaerr != cudaSuccess) {
-	    LOG_WARNING << "Dynamic Scheduler failed to get Bus ID for device"
-		                            << cudaGetErrorString(cudaerr);
-    	continue;
+            LOG_WARNING << "Dynamic Scheduler failed to get Bus ID for device"
+                                            << cudaGetErrorString(cudaerr);
+        continue;
     }
 
     nvmlDevice_t gpu;
-    nvmlReturn_t nvmlerr = nvmlDeviceGetHandleByPciBusId_v2(pcibusid_str, &gpu);
+    nvmlerr = nvmlDeviceGetHandleByPciBusId_v2(pcibusid_str, &gpu);
     if (nvmlerr != NVML_SUCCESS){
-	    LOG_WARNING << "Failed to get device from Bus ID "
-		                            << nvmlErrorString(nvmlerr);
-	    continue;
+            LOG_WARNING << "Failed to get device from Bus ID "
+                                            << nvmlErrorString(nvmlerr);
+            continue;
     }
     sched_device.emplace_back(gpu);
   }
@@ -107,44 +108,36 @@ DynamicBatchScheduler::DynamicBatchScheduler(
   std::ifstream config_c("/opt/tritonserver/config");
   std::string tmp;
 
-  for (int i = 0; i < 4; i++)
-  {
+  for (int i = 0; i < 4; i++) {
     std::getline(config_c,tmp);
     up_.emplace_back(std::stoi(tmp));
   }
   down_.emplace_back(0);
-  for (int i = 0; i < 3; i++)
-  {
+  for (int i = 0; i < 3; i++) {
     std::getline(config_c,tmp);
     down_.emplace_back(std::stoi(tmp));
   }
 
   std::getline(config_c,tmp);
   int n = std::stoi(tmp);
-  for (int i = 0; i < n; i++)
-  {
+  for (int i = 0; i < n; i++) {
     std::getline(config_c,tmp);
     clist_.emplace_back(std::stoi(tmp));
   }
-  clist_.emplace_back(2100); // Max GPU clock
+  clist_.emplace_back(clist_.back());
 
-  for (int i= 0; i< 4; i++)
-  {
-    for (int j = 0; j < n; j++)
-    {
-      if(clist_[j]>=(int)up_[i]){
+  for (int i= 0; i< 4; i++) {
+    for (int j = 0; j < n; j++) {
+      if((double)clist_[j]>=up_[i]) {
         up.emplace_back(j);
         break;
       }
     }
-    
   }
   down.emplace_back(0);
-  for (int i= 1; i< 4; i++)
-  {
-    for (int j = n-1; j > 0; j--)
-    {
-      if(clist_[j]<(int)down_[i]){
+  for (int i= 1; i< 4; i++) {
+    for (int j = n-1; j > 0; j--) {
+      if((double)clist_[j]<=(1-alpha)*(down_[i])) {
         down.emplace_back(j);
         break;
       }
@@ -154,9 +147,16 @@ DynamicBatchScheduler::DynamicBatchScheduler(
   q_max = n-1;
   scale_u = up_[0];
   scale_d = down_[0];
-  for (int i=0;i<4;i++){
+
+  // Set GPUs clock to lowest
+  for (int i=0;i<4;i++) {
     nvmlDeviceSetGpuLockedClocks(sched_device[i], 0,0);
   }
+
+  cur_clock = clist_[0];
+  active_scheduler_thread_cnt_ = 1;
+  su = up[active_scheduler_thread_cnt_-1];
+  sd = down[active_scheduler_thread_cnt_-1];
 }
 
 Status
@@ -220,11 +220,6 @@ DynamicBatchScheduler::Create(
           dyna_sched->SchedulerThread(
               runner_id, nice, thread_exit, &init_state);
         }));
-    // sched->scheduler_threads_.emplace_back(new std::thread(
-    //    [dyna_sched, runner_id, thread_exit]() {
-    //       dyna_sched->ClockThread(
-    //           runner_id, thread_exit);
-    //    }));
     if (!init_state.get_future().get()) {
       if (sched->scheduler_threads_.back()->joinable()) {
         sched->scheduler_threads_.back()->join();
@@ -274,9 +269,6 @@ DynamicBatchScheduler::~DynamicBatchScheduler()
   }
 }
 
-void test(nvmlDevice_t dev, unsigned int clock) {
-  nvmlDeviceSetGpuLockedClocks(dev, clock,clock);
-}
 
 Status
 DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
@@ -289,51 +281,64 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
       request->QueueStartNs());
   
   Status enqueue_status;
-  unsigned int target_clock;
+  bool change = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    unsigned int target_clock;
+    int qs = queue_.Size()+1; // add this request and running request
     int rest = 0;
     int temp;
-    
     {
-      rest = 0;
-      unsigned int idx,idx2;
-      temp = 1+((queue_.Size()+1)/(int)active_scheduler_thread_cnt_);
+      unsigned int idx;
+      temp = 1+(qs/(int)active_scheduler_thread_cnt_); // ceil(a/b) == (a+b-1)/b
       idx = q_max<temp?q_max:temp;
-      idx2=idx;
-   
-      if (idx >= up[active_scheduler_thread_cnt_-1] && 
-                          scheduler_thread_cnt_-active_scheduler_thread_cnt_) {
-        idx2= down[active_scheduler_thread_cnt_];
+       
+      if (idx >= su &&
+        scheduler_thread_cnt_-active_scheduler_thread_cnt_) {
         rest++;
+        target_clock = clist_[down[active_scheduler_thread_cnt_]];
       }
-      else if ( idx < down[active_scheduler_thread_cnt_-1] && 
-                              active_scheduler_thread_cnt_-1) {
-        idx2=up[active_scheduler_thread_cnt_+(--rest)];
+      else if ( idx < sd && active_scheduler_thread_cnt_-1) {
+        rest--;
+        target_clock = clist_[up[active_scheduler_thread_cnt_-2]];
       }
-
-      target_clock = clist_[idx2];
+      else{
+        target_clock = clist_[idx];
+      }
+      
     }
-    
-    request->setTargetClock(target_clock,active_scheduler_thread_cnt_+rest);
-    {
-      if (cur_clock < target_clock || rest > 0)
-      {
-        active_scheduler_thread_cnt_+=rest;
-        change_ = true;cnt++;
-        cur_clock = target_clock;
-      }
-    } // clock update
+
+    if (cur_clock < target_clock) {
+      cur_clock = target_clock;
+      change=true;
+    }
+
+    // scale-out
+    if (rest==1) {
+      change=false;
+      nvmlDeviceSetGpuLockedClocks(sched_device[active_scheduler_thread_cnt_], 
+                                  cur_clock, cur_clock);
+      active_scheduler_thread_cnt_++;
+      su = up[active_scheduler_thread_cnt_-1];
+      sd = down[active_scheduler_thread_cnt_-1];
+      rest = 0;
+    }
+    //scale-in
+    else if(rest==-1) {
+      change=true;
+    }
 
     // Set extra information
-    
+    // request->setTargetClock(target_clock);
     // request->setTargetThreads(active_scheduler_thread_cnt_);
+    request->target_clock_=target_clock;
+    request->threads_=active_scheduler_thread_cnt_+rest;
     // queued_batch_size_ += std::max(1U, request->BatchSize());
 
     // Assuming no error is returned, this call takes ownership of
     // 'request' and so we can't use it after this point.
-    RETURN_IF_ERROR(queue_.Enqueue(/*request->Priority()*/0, request));
-    
+    RETURN_IF_ERROR(queue_.Enqueue(/*request->Priority()*/ 0, request));
+
     // If there are any idle runners and the queued batch size is greater or
     // equal to next preferred batch size, then wake one up to service this
     // request. We do the actual wake outside of the lock to avoid having the
@@ -341,13 +346,12 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     // wake_runner = (idle_scheduler_thread_cnt_ > 0);
   }
 
-  if(change_)
-  {
-    for(uint32_t i =0; i< active_scheduler_thread_cnt_;i++)
-    {
-      std::async(std::launch::async, test, sched_device[i], cur_clock);
+  if(change) {
+    for(uint32_t i =0; i< active_scheduler_thread_cnt_;i++) {
+		  nvmlDeviceSetGpuLockedClocks(sched_device[i], cur_clock,cur_clock);
     }
   }
+  cv_.notify_one();
   return Status::Success;
 }
 
@@ -419,16 +423,17 @@ DynamicBatchScheduler::SchedulerThread(
   std::shared_ptr<std::atomic<bool>> thread_exit = rthread_exit;
 
   const uint64_t default_wait_microseconds = 500 * 1000;
-
+  int cnt=0;
   while (!thread_exit->load()) {
     NVTX_RANGE(nvtx_, "DynamicBatchScheduler " + runner_id);
 
-    if (runner_id>=this->active_scheduler_thread_cnt_) {
-      nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],0,0);
+    if ( runner_id >= this->active_scheduler_thread_cnt_) {
+      if (cnt++==1) nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],0,0);
       std::this_thread::sleep_for(
             std::chrono::milliseconds(1));
       continue;
     }
+    cnt=0;
     std::vector<std::unique_ptr<InferenceRequest>> requests;
     std::shared_ptr<std::vector<std::deque<std::unique_ptr<InferenceRequest>>>>
         rejected_requests;
@@ -464,7 +469,6 @@ DynamicBatchScheduler::SchedulerThread(
           for (size_t idx = 0; idx < pending_batch_queue_cnt; ++idx) {
             std::unique_ptr<InferenceRequest> request;
             auto status = queue_.Dequeue(&request);
-            while(1);
             if (status.IsOk()) {
               requests.emplace_back(std::move(request));
             } else {
@@ -589,37 +593,37 @@ DynamicBatchScheduler::SchedulerThread(
       }
     }
 
-    unsigned int max_freq = cur_clock;
+    bool change_ = false;
     {
-      std::unique_lock<std::mutex> lock(mu_);
-     
+      unsigned int max_freq = clist_[0];
+      std::lock_guard<std::mutex> lock(mu_);
+
       unsigned int max_thread = 1;
-      // unsigned int min_thread = 4;
       queue_.ResetCursor();
-      int qn = queue_.Size();
-      if (qn == 0) max_freq=clist_[0];
-      else{
-        while (!queue_.CursorEnd()) {
-          max_freq=std::max(max_freq,queue_.RequestAtCursor()->target_clock_);
-          max_thread=std::max(max_thread, queue_.RequestAtCursor()->threads_);
-          queue_.AdvanceCursor();
-        }
+      while (!queue_.CursorEnd()) {
+        max_freq=std::max(max_freq,queue_.RequestAtCursor()->target_clock_);
+        max_thread=std::max(max_thread, queue_.RequestAtCursor()->threads_);
+		    queue_.AdvanceCursor();
       }
 
-      active_scheduler_thread_cnt_=max_thread;
-      if(cur_clock>max_freq)
-      {
+      if(active_scheduler_thread_cnt_ != max_thread) {
+        active_scheduler_thread_cnt_=max_thread;
+        su = up[active_scheduler_thread_cnt_-1];
+        sd = down[active_scheduler_thread_cnt_-1];
+      }
+
+      if (cur_clock>max_freq ) {
         cur_clock = max_freq;
         change_ = true;
-        // cnt++;
       }
     }
 
     if(change_) {
-      for(uint32_t i =0; i<active_scheduler_thread_cnt_;i++)
-        std::async(std::launch::async, test, sched_device[i],cur_clock);
-      }   
-      
+       for(uint32_t i =0; i<active_scheduler_thread_cnt_;i++) {
+         nvmlDeviceSetGpuLockedClocks(sched_device[i], cur_clock,cur_clock);
+       }
+    }
+
 
     // FIXME, this isn't really true anymore so needs to be revisited.
     //
