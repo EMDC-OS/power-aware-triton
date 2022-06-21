@@ -41,16 +41,14 @@
 #include <cmath>
 #include <array>
 
-std::vector<int> clist_;
-int q_max = 0;
-std::vector<unsigned int> up_;
-std::vector<unsigned int> down_;
-std::vector<unsigned int> up;
-std::vector<unsigned int> down;
-unsigned int su;
-unsigned int sd;
-double alpha = 0;
-int count = 0;
+#define min_(a,b) ((a)<(b)?(a):(b))
+#define max_(a,b) ((a)>(b)?(a):(b))
+
+std::vector<unsigned int> clist_;
+std::vector<uint64_t> exp_time;
+unsigned int q_max = 0;
+unsigned int cur_idx = 0; // For maintaining the current freq.
+uint64_t slo = 0;         // SLO target
 
 namespace nvidia { namespace inferenceserver {
 
@@ -105,58 +103,42 @@ DynamicBatchScheduler::DynamicBatchScheduler(
     sched_device.emplace_back(gpu);
   }
 
+  // Read the configuration from "config"
   std::ifstream config_c("/opt/tritonserver/config");
   std::string tmp;
 
-  for (int i = 0; i < 4; i++) {
+  // This data used for multi-GPU version
+  // 4 for sclae-up and 3 for scale-down
+  for (int i = 0; i < 7; i++) 
     std::getline(config_c,tmp);
-    up_.emplace_back(std::stoi(tmp));
-  }
-  down_.emplace_back(0);
-  for (int i = 0; i < 3; i++) {
-    std::getline(config_c,tmp);
-    down_.emplace_back(std::stoi(tmp));
-  }
 
   std::getline(config_c,tmp);
+  slo = std::stoll(tmp);
+  
+  std::getline(config_c,tmp);
   int n = std::stoi(tmp);
+
+  clist_.emplace_back(0);
   for (int i = 0; i < n; i++) {
     std::getline(config_c,tmp);
     clist_.emplace_back(std::stoi(tmp));
   }
-  clist_.emplace_back(clist_.back());
 
-  for (int i= 0; i< 4; i++) {
-    for (int j = 0; j < n; j++) {
-      if((double)clist_[j]>=up_[i]) {
-        up.emplace_back(j);
-        break;
-      }
-    }
-  }
-  down.emplace_back(0);
-  for (int i= 1; i< 4; i++) {
-    for (int j = n-1; j > 0; j--) {
-      if((double)clist_[j]<=(1-alpha)*(down_[i])) {
-        down.emplace_back(j);
-        break;
-      }
-    }
+  exp_time.emplace_back(slo);
+  for (int i = 1; i < n+1; i++) {
+    exp_time.emplace_back((uint64_t)(slo/i));
   }
 
   q_max = n-1;
-  scale_u = up_[0];
-  scale_d = down_[0];
 
   // Set GPUs clock to lowest
-  for (int i=0;i<4;i++) {
+  for (int i=0;i<(int)scheduler_thread_cnt_+1;i++) {
     nvmlDeviceSetGpuLockedClocks(sched_device[i], 0,0);
   }
 
   cur_clock = clist_[0];
+  cur_idx = 0;
   active_scheduler_thread_cnt_ = 1;
-  su = up[active_scheduler_thread_cnt_-1];
-  sd = down[active_scheduler_thread_cnt_-1];
 }
 
 Status
@@ -275,83 +257,24 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 {
   // Queue timer starts at the beginning of the queueing and
   // scheduling process
-  request->CaptureQueueStartNs();
-  INFER_TRACE_ACTIVITY(
-      request->Trace(), TRITONSERVER_TRACE_QUEUE_START,
-      request->QueueStartNs());
-  
-  Status enqueue_status;
-  bool change = false;
+  request->CaptureQueueStartNs(slo);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    unsigned int target_clock;
-    int qs = queue_.Size()+1; // add this request and running request
-    int rest = 0;
-    int temp;
-    {
-      unsigned int idx;
-      temp = 1+(qs/(int)active_scheduler_thread_cnt_); // ceil(a/b) == (a+b-1)/b
-      idx = q_max<temp?q_max:temp;
-       
-      if (idx >= su &&
-        scheduler_thread_cnt_-active_scheduler_thread_cnt_) {
-        rest++;
-        target_clock = clist_[down[active_scheduler_thread_cnt_]];
-      }
-      else if ( idx < sd && active_scheduler_thread_cnt_-1) {
-        rest--;
-        target_clock = clist_[up[active_scheduler_thread_cnt_-2]];
-      }
-      else{
-        target_clock = clist_[idx];
-      }
-      
-    }
+    unsigned int idx = min_((unsigned int)queue_.Size()+2, q_max);
+    request->target_idx=idx;
 
-    if (cur_clock < target_clock) {
-      cur_clock = target_clock;
-      change=true;
+    if (cur_idx < idx) {
+      cur_idx = idx;
+      nvmlDeviceSetGpuLockedClocks(sched_device[0], clist_[idx], clist_[idx]);
     }
-
-    // scale-out
-    if (rest==1) {
-      change=false;
-      nvmlDeviceSetGpuLockedClocks(sched_device[active_scheduler_thread_cnt_], 
-                                  cur_clock, cur_clock);
-      active_scheduler_thread_cnt_++;
-      su = up[active_scheduler_thread_cnt_-1];
-      sd = down[active_scheduler_thread_cnt_-1];
-      rest = 0;
-    }
-    //scale-in
-    else if(rest==-1) {
-      change=true;
-    }
-
-    // Set extra information
-    // request->setTargetClock(target_clock);
-    // request->setTargetThreads(active_scheduler_thread_cnt_);
-    request->target_clock_=target_clock;
-    request->threads_=active_scheduler_thread_cnt_+rest;
-    // queued_batch_size_ += std::max(1U, request->BatchSize());
 
     // Assuming no error is returned, this call takes ownership of
     // 'request' and so we can't use it after this point.
     RETURN_IF_ERROR(queue_.Enqueue(/*request->Priority()*/ 0, request));
 
-    // If there are any idle runners and the queued batch size is greater or
-    // equal to next preferred batch size, then wake one up to service this
-    // request. We do the actual wake outside of the lock to avoid having the
-    // woken thread immediately block on the lock
-    // wake_runner = (idle_scheduler_thread_cnt_ > 0);
+    cv_.notify_one();
   }
 
-  if(change) {
-    for(uint32_t i =0; i< active_scheduler_thread_cnt_;i++) {
-		  nvmlDeviceSetGpuLockedClocks(sched_device[i], cur_clock,cur_clock);
-    }
-  }
-  cv_.notify_one();
   return Status::Success;
 }
 
@@ -423,17 +346,9 @@ DynamicBatchScheduler::SchedulerThread(
   std::shared_ptr<std::atomic<bool>> thread_exit = rthread_exit;
 
   const uint64_t default_wait_microseconds = 500 * 1000;
-  int cnt=0;
   while (!thread_exit->load()) {
     NVTX_RANGE(nvtx_, "DynamicBatchScheduler " + runner_id);
 
-    if ( runner_id >= this->active_scheduler_thread_cnt_) {
-      if (cnt++==1) nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],0,0);
-      std::this_thread::sleep_for(
-            std::chrono::milliseconds(1));
-      continue;
-    }
-    cnt=0;
     std::vector<std::unique_ptr<InferenceRequest>> requests;
     std::shared_ptr<std::vector<std::deque<std::unique_ptr<InferenceRequest>>>>
         rejected_requests;
@@ -571,14 +486,23 @@ DynamicBatchScheduler::SchedulerThread(
     }
 
     if (!requests.empty()) {
+      uint64_t res_time = requests[0]->remain_time_ns_ 
+                - std::chrono::steady_clock::now().time_since_epoch().count();
+      if (q_max > cur_idx && res_time < exp_time[cur_idx]) {
+        cur_idx = q_max;
+        if (res_time < slo) cur_idx =min_(1 + slo / res_time, q_max);
+        nvmlDeviceSetGpuLockedClocks(sched_device[0], 
+                                    clist_[cur_idx],clist_[cur_idx]);
+      }
+
       OnSchedule_(runner_id, std::move(requests));
       // For testing we introduce a delay here to make the
       // "DynamicBatchScheduler destroyed by this thread" case
       // described in the comment below reproducible.
-      if (backend_release_wait_milliseconds > 0) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(backend_release_wait_milliseconds));
-      }
+      // if (backend_release_wait_milliseconds > 0) {
+      //   std::this_thread::sleep_for(
+      //       std::chrono::milliseconds(backend_release_wait_milliseconds));
+      // }
     }
 
     // Finish rejected requests if any
@@ -593,35 +517,29 @@ DynamicBatchScheduler::SchedulerThread(
       }
     }
 
-    bool change_ = false;
-    {
-      unsigned int max_freq = clist_[0];
+    // if queue is not empty,
+    if(cur_idx){
       std::lock_guard<std::mutex> lock(mu_);
 
-      unsigned int max_thread = 1;
       queue_.ResetCursor();
-      while (!queue_.CursorEnd()) {
-        max_freq=std::max(max_freq,queue_.RequestAtCursor()->target_clock_);
-        max_thread=std::max(max_thread, queue_.RequestAtCursor()->threads_);
-		    queue_.AdvanceCursor();
+      if(queue_.RequestAtCursor()->remain_time_ns_
+              - std::chrono::steady_clock::now().time_since_epoch().count()
+              > exp_time[cur_idx-1]) {
+        unsigned int idx=0;
+        
+        while (!queue_.CursorEnd()) {
+          idx = max_(idx, queue_.RequestAtCursor()->target_idx);
+          queue_.AdvanceCursor();
+        }
+
+        if (cur_idx> idx ) {
+          cur_idx = idx;
+          nvmlDeviceSetGpuLockedClocks(sched_device[0],
+                                        clist_[idx], clist_[idx]);
+        }
       }
 
-      if(active_scheduler_thread_cnt_ != max_thread) {
-        active_scheduler_thread_cnt_=max_thread;
-        su = up[active_scheduler_thread_cnt_-1];
-        sd = down[active_scheduler_thread_cnt_-1];
-      }
-
-      if (cur_clock>max_freq ) {
-        cur_clock = max_freq;
-        change_ = true;
-      }
-    }
-
-    if(change_) {
-       for(uint32_t i =0; i<active_scheduler_thread_cnt_;i++) {
-         nvmlDeviceSetGpuLockedClocks(sched_device[i], cur_clock,cur_clock);
-       }
+      cv_.notify_one();
     }
 
 
