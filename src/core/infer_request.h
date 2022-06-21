@@ -417,10 +417,19 @@ class InferenceRequest {
   uint64_t QueueStartNs() const { return queue_start_ns_; }
   uint64_t CaptureQueueStartNs()
   {
-    queue_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
+    queue_start_ns_ = 
+             std::chrono::steady_clock::now().time_since_epoch()
              .count();
     return queue_start_ns_;
+  }
+  uint64_t CaptureQueueStartNs(uint64_t SLO)
+  {
+    queue_start_ns_ = 
+             std::chrono::steady_clock::now().time_since_epoch()
+             .count();
+    remain_time_ns_ = SLO + queue_start_ns_;
+
+    return remain_time_ns_;
   }
 
 #ifdef TRITON_ENABLE_STATS
@@ -458,23 +467,11 @@ class InferenceRequest {
   }
 #endif  // TRITON_ENABLE_STATS
 
-  void setTargetClock(unsigned int clock){
-    this->target_clock_ = clock;
-  }
-  
-  unsigned int getTargetClock(){
-    return this->target_clock_;
-  }
-
-  void setTargetThreads(unsigned int thread){
-    this->threads_ = thread;
-  }
-  
-  unsigned int getTargetThreads(){
-    return this->threads_;
-  }
-  unsigned int target_clock_;
+  unsigned int target_idx;
   unsigned int threads_;
+  uint64_t queue_start_ns_;
+  uint64_t remain_time_ns_;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(InferenceRequest);
   friend std::ostream& operator<<(
@@ -537,7 +534,7 @@ class InferenceRequest {
 
   // Request timestamps. Queue start is needed for schedulers even
   // when statistics are not being collected.
-  uint64_t queue_start_ns_;
+  // uint64_t queue_start_ns_;
 
   // Whether the stats of the request should be collected.
   bool collect_stats_;
