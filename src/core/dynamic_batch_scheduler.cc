@@ -47,7 +47,7 @@
 std::vector<unsigned int> clist_;
 std::vector<uint64_t> exp_time;
 unsigned int q_max = 0;
-unsigned int cur_idx = 0; // For maintaining the current freq.
+unsigned int cur_idx = 0; // For the current freq.
 uint64_t slo = 0;         // SLO target
 
 namespace nvidia { namespace inferenceserver {
@@ -263,17 +263,14 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
     unsigned int idx = min_((unsigned int)queue_.Size()+2, q_max);
     request->target_idx=idx;
 
+    RETURN_IF_ERROR(queue_.Enqueue(0, request));
+
     if (cur_idx < idx) {
       cur_idx = idx;
       nvmlDeviceSetGpuLockedClocks(sched_device[0], clist_[idx], clist_[idx]);
     }
-
-    // Assuming no error is returned, this call takes ownership of
-    // 'request' and so we can't use it after this point.
-    RETURN_IF_ERROR(queue_.Enqueue(/*request->Priority()*/ 0, request));
-
-    cv_.notify_one();
   }
+  // cv_.notify_one();
 
   return Status::Success;
 }
@@ -357,7 +354,7 @@ DynamicBatchScheduler::SchedulerThread(
 
     // Hold the lock for as short a time as possible.
     {
-      std::unique_lock<std::mutex> lock(mu_);
+      std::lock_guard<std::mutex> lock(mu_);
       if (delay_cnt > 0) {
         // Debugging/testing... wait until queue contains 'delay_cnt'
         // items...
@@ -472,13 +469,15 @@ DynamicBatchScheduler::SchedulerThread(
       if (wait_microseconds > 0) {
         idle_scheduler_thread_cnt_++;
         std::chrono::microseconds wait_timeout(wait_microseconds);
-        cv_.wait_for(lock, wait_timeout);
+        // cv_.wait_for(lock, wait_timeout);
         idle_scheduler_thread_cnt_--;
       }
     }
+    
+    // cv_.notify_one();
 
     if (wake_thread) {
-      cv_.notify_one();
+
     }
 
     if (!requests.empty()) {
@@ -527,17 +526,15 @@ DynamicBatchScheduler::SchedulerThread(
           idx = max_(idx, queue_.RequestAtCursor()->target_idx);
           queue_.AdvanceCursor();
         }
-
+        
         if (cur_idx> idx ) {
           cur_idx = idx;
           nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],
-                                        clist_[idx], clist_[idx]);
+                                        clist_[cur_idx], clist_[cur_idx]);
         }
       }
-
-      cv_.notify_one();
     }
-
+    // cv_.notify_one();
 
     // FIXME, this isn't really true anymore so needs to be revisited.
     //
