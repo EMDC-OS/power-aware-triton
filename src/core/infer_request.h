@@ -422,7 +422,7 @@ class InferenceRequest {
              .count();
     return queue_start_ns_;
   }
-  uint64_t CaptureQueueStartNs(uint64_t SLO)
+  int64_t CaptureQueueStartNs(int64_t SLO)
   {
     queue_start_ns_ = 
              std::chrono::steady_clock::now().time_since_epoch()
@@ -470,7 +470,7 @@ class InferenceRequest {
   unsigned int target_idx;
   unsigned int threads_;
   uint64_t queue_start_ns_;
-  uint64_t remain_time_ns_;
+  int64_t remain_time_ns_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InferenceRequest);

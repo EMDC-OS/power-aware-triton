@@ -45,10 +45,10 @@
 #define max_(a,b) ((a)>(b)?(a):(b))
 
 std::vector<unsigned int> clist_;
-std::vector<uint64_t> exp_time;
+std::vector<int64_t> exp_time;
 unsigned int q_max = 0;
 unsigned int cur_idx = 0; // For the current freq.
-uint64_t slo = 0;         // SLO target
+int64_t slo = 0;         // SLO target
 
 namespace nvidia { namespace inferenceserver {
 
@@ -126,10 +126,10 @@ DynamicBatchScheduler::DynamicBatchScheduler(
 
   exp_time.emplace_back(slo);
   for (int i = 1; i < n+1; i++) {
-    exp_time.emplace_back((uint64_t)(slo/i));
+    exp_time.emplace_back((int64_t)(slo/i));
   }
 
-  q_max = n;
+  q_max = n;  
 
   // Set GPUs clock to lowest
   for (int i=0;i<(int)scheduler_thread_cnt_+1;i++) {
@@ -258,19 +258,18 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
   // Queue timer starts at the beginning of the queueing and
   // scheduling process
   request->CaptureQueueStartNs(slo);
+  unsigned int idx=0;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    unsigned int idx = min_((unsigned int)queue_.Size()+2, q_max);
+    idx = min_(queue_.Size()+2, q_max);
     request->target_idx=idx;
-
-    RETURN_IF_ERROR(queue_.Enqueue(0, request));
-
-    if (cur_idx < idx) {
-      cur_idx = idx;
-      nvmlDeviceSetGpuLockedClocks(sched_device[0], clist_[idx], clist_[idx]);
-    }
+    RETURN_IF_ERROR(queue_.Enqueue(0, request));    
   }
-  // cv_.notify_one();
+
+  if (cur_idx < idx) {
+    cur_idx = idx;
+    nvmlDeviceSetGpuLockedClocks(sched_device[0], clist_[idx], clist_[idx]);
+  }
 
   return Status::Success;
 }
@@ -342,103 +341,28 @@ DynamicBatchScheduler::SchedulerThread(
   // exit. See comment at end of function for explanation.
   std::shared_ptr<std::atomic<bool>> thread_exit = rthread_exit;
 
-  const uint64_t default_wait_microseconds = 500 * 1000;
+  // const uint64_t default_wait_microseconds = 500 * 1000;
   while (!thread_exit->load()) {
     NVTX_RANGE(nvtx_, "DynamicBatchScheduler " + runner_id);
 
     std::vector<std::unique_ptr<InferenceRequest>> requests;
     std::shared_ptr<std::vector<std::deque<std::unique_ptr<InferenceRequest>>>>
         rejected_requests;
-    bool wake_thread = false;
-    uint64_t wait_microseconds = 0;
 
     // Hold the lock for as short a time as possible.
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (delay_cnt > 0) {
-        // Debugging/testing... wait until queue contains 'delay_cnt'
-        // items...
-        wait_microseconds = 10 * 1000;
-        if (queue_.Size() >= delay_cnt) {
-          delay_cnt = 0;
-        }
-        LOG_VERBOSE(1) << "Delaying scheduler thread " << runner_id << " until "
-                       << delay_cnt
-                       << " queued requests, current total = " << queue_.Size();
-      } else if (queue_.Empty()) {
-        wait_microseconds = default_wait_microseconds;
-      } else if (dynamic_batching_enabled_) {
-        // Use dynamic batching to get request(s) to execute.
-        wait_microseconds = GetDynamicBatch(runner_id);
-
-        // Get requests that are rejected from searching dynamic batch.
-        queue_.ReleaseRejectedRequests(&rejected_requests);
-
-        // Extract batch only if there is pending batch
-        auto pending_batch_queue_cnt = queue_.PendingBatchCount();
-        if ((wait_microseconds == 0) && (pending_batch_queue_cnt != 0)) {
-          requests.reserve(pending_batch_queue_cnt);
-          for (size_t idx = 0; idx < pending_batch_queue_cnt; ++idx) {
-            std::unique_ptr<InferenceRequest> request;
-            auto status = queue_.Dequeue(&request);
-            if (status.IsOk()) {
-              requests.emplace_back(std::move(request));
-            } else {
-              // The queue is empty which conflicts with pending batch count.
-              // Send the current batch if any and reset related variables.
-              LOG_ERROR << "Failed to retrieve request from scheduler queue: "
-                        << status.Message();
-              queue_.ResetCursor();
-              queued_batch_size_ = 0;
-              pending_batch_size_ = 0;
-              break;
-            }
-          }
-          if (preserve_ordering_ && !requests.empty()) {
-            std::lock_guard<std::mutex> lock(completion_queue_mtx_);
-            for (auto& request : requests) {
-              completion_queue_.emplace_back();
-              auto queue_slot = &completion_queue_.back();
-              request->SetResponseDelegator(
-                  [this, queue_slot](
-                      std::unique_ptr<InferenceResponse>&& response,
-                      const uint32_t flags) {
-                    {
-                      std::lock_guard<std::mutex> lock(completion_queue_mtx_);
-                      queue_slot->emplace_back(std::move(response), flags);
-                    }
-                    FinalizeResponses();
-                  });
-            }
-          }
-
-          queued_batch_size_ -= pending_batch_size_;
-          // Set next preferred to be 0 so that enqueue thread will wake up
-          // runners when new request arrives. In the case where the queue
-          // becomes empty, this helps the runners to set up proper wait time
-          // instead of waiting for the default timer or actual next preferred
-          // batch size is reached.
-          next_preferred_batch_size_ = 0;
-
-          pending_batch_size_ = 0;
-          required_equal_inputs_.clear();
-
-          // If there are still requests in the queue after removing
-          // the pending batch and if there are any idle threads then
-          // wake one up to service the requests remaining in the
-          // queue. We need this special wake logic for the dynamic
-          // batching case because we may delay handling requests in
-          // the queue and so idle the threads that would normally be
-          // handling those requests. We do the actual wake outside of
-          // the lock to avoid having the woken thread immediately
-          // block on the lock.
-          wake_thread = !queue_.Empty() && (idle_scheduler_thread_cnt_ > 0);
+      if (queue_.Empty()) {
+        if(cur_idx)
+        {
+          cur_idx--;;
+          if(cur_idx==0)nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],clist_[cur_idx],clist_[cur_idx]);  
         }
       } else {
-        // if (fluctuation == -1) fluctuation=0;
         // No batching... execute next request
         std::unique_ptr<InferenceRequest> request;
         auto status = queue_.Dequeue(&request);
+        // qt.pop_front();
         if (status.IsOk()) {
           requests.emplace_back(std::move(request));
           if (preserve_ordering_) {
@@ -463,34 +387,21 @@ DynamicBatchScheduler::SchedulerThread(
                     << status.Message();
         }
       }
-
-      // If no requests are to be handled, wait for notification or
-      // for the specified timeout before checking the queue again.
-      if (wait_microseconds > 0) {
-        idle_scheduler_thread_cnt_++;
-        std::chrono::microseconds wait_timeout(wait_microseconds);
-        // cv_.wait_for(lock, wait_timeout);
-        idle_scheduler_thread_cnt_--;
-      }
     }
     
-    // cv_.notify_one();
-
-    if (wake_thread) {
-
-    }
-
     if (!requests.empty()) {
-      uint64_t res_time = requests[0]->remain_time_ns_ 
-                - std::chrono::steady_clock::now().time_since_epoch().count();
-      if (q_max > cur_idx && res_time < exp_time[cur_idx]) {
-        cur_idx = q_max;
-        if (res_time < slo) cur_idx =min_(1 + slo / res_time, q_max);
-        nvmlDeviceSetGpuLockedClocks(sched_device[runner_id], 
-                                    clist_[cur_idx],clist_[cur_idx]);
+      {
+        int64_t res_time = requests[0]->remain_time_ns_ 
+                  - std::chrono::steady_clock::now().time_since_epoch().count();
+        if(q_max > cur_idx && res_time < exp_time[cur_idx]){
+          if(res_time<0) cur_idx=q_max;
+          else cur_idx =min_((unsigned int)(1+slo / res_time), q_max);
+          nvmlDeviceSetGpuLockedClocks(sched_device[runner_id], 
+                                      clist_[cur_idx],clist_[cur_idx]);
+        }
       }
 
-      OnSchedule_(runner_id, std::move(requests));
+      OnSchedule_(runner_id, std::move(requests));     
       // For testing we introduce a delay here to make the
       // "DynamicBatchScheduler destroyed by this thread" case
       // described in the comment below reproducible.
@@ -513,28 +424,23 @@ DynamicBatchScheduler::SchedulerThread(
     }
 
     // if queue is not empty,
-    if(cur_idx){
+    unsigned int idx=0;
+    
+    if (cur_idx) {
       std::lock_guard<std::mutex> lock(mu_);
-
       queue_.ResetCursor();
-      if(queue_.RequestAtCursor()->remain_time_ns_
-              - std::chrono::steady_clock::now().time_since_epoch().count()
-              > exp_time[cur_idx-1]) {
-        unsigned int idx=0;
-        
-        while (!queue_.CursorEnd()) {
-          idx = max_(idx, queue_.RequestAtCursor()->target_idx);
-          queue_.AdvanceCursor();
-        }
-        
-        if (cur_idx> idx ) {
-          cur_idx = idx;
-          nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],
-                                        clist_[cur_idx], clist_[cur_idx]);
-        }
+      for (int i = queue_.Size();i>0;i--) {
+        idx = max_(idx, queue_.RequestAtCursor_());
       }
     }
-    // cv_.notify_one();
+
+    if (cur_idx>idx+2) {
+      std::lock_guard<std::mutex> lock(clock_);
+      cur_idx--;//idx;
+
+      nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],
+                                    clist_[cur_idx], clist_[cur_idx]);
+    }
 
     // FIXME, this isn't really true anymore so needs to be revisited.
     //

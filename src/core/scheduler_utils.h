@@ -109,6 +109,15 @@ class PriorityQueue {
     return pending_cursor_.curr_it_->second.At(pending_cursor_.queue_idx_);
   }
 
+  // Return the target_idx at the cursor. RequestAtCursor() + AdvanceCursor()
+  unsigned int RequestAtCursor_()
+  {
+    unsigned int idx = pending_cursor_.curr_it_
+                          ->second.At(pending_cursor_.queue_idx_)->target_idx;
+    AdvanceCursor();
+    return idx;
+  }
+
   // Advance the cursor for pending batch. This function will not trigger the
   // queue policy. No effect if the cursor already reach the end of the queue.
   void AdvanceCursor();
