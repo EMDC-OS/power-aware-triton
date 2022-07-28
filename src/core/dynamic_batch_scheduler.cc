@@ -251,6 +251,9 @@ DynamicBatchScheduler::~DynamicBatchScheduler()
   }
 }
 
+void LockedClocks(nvmlDevice_t dev, unsigned int clock) {
+  nvmlDeviceSetGpuLockedClocks(dev, clock, clock);
+}
 
 Status
 DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
@@ -268,7 +271,8 @@ DynamicBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 
   if (cur_idx < idx) {
     cur_idx = idx;
-    nvmlDeviceSetGpuLockedClocks(sched_device[0], clist_[idx], clist_[idx]);
+    std::thread thread_(LockedClocks, sched_device[0], clist_[idx]);
+    thread_.detach();
   }
 
   return Status::Success;
@@ -352,17 +356,11 @@ DynamicBatchScheduler::SchedulerThread(
     // Hold the lock for as short a time as possible.
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (queue_.Empty()) {
-        if(cur_idx)
-        {
-          cur_idx--;;
-          if(cur_idx==0)nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],clist_[cur_idx],clist_[cur_idx]);  
-        }
-      } else {
+      if (!queue_.Empty()){
         // No batching... execute next request
         std::unique_ptr<InferenceRequest> request;
         auto status = queue_.Dequeue(&request);
-        // qt.pop_front();
+
         if (status.IsOk()) {
           requests.emplace_back(std::move(request));
           if (preserve_ordering_) {
@@ -393,11 +391,15 @@ DynamicBatchScheduler::SchedulerThread(
       {
         int64_t res_time = requests[0]->remain_time_ns_ 
                   - std::chrono::steady_clock::now().time_since_epoch().count();
-        if(q_max > cur_idx && res_time < exp_time[cur_idx]){
-          if(res_time<0) cur_idx=q_max;
-          else cur_idx =min_((unsigned int)(1+slo / res_time), q_max);
-          nvmlDeviceSetGpuLockedClocks(sched_device[runner_id], 
-                                      clist_[cur_idx],clist_[cur_idx]);
+        if(res_time < exp_time[cur_idx])
+        {
+          unsigned int c = res_time>exp_time[q_max]?min_((unsigned int)(1+slo / res_time), q_max):q_max;
+
+          if(c>cur_idx) {
+            cur_idx=c;
+            std::thread thread_(LockedClocks, sched_device[0], clist_[c]);
+            thread_.detach();
+          }
         }
       }
 
@@ -423,23 +425,22 @@ DynamicBatchScheduler::SchedulerThread(
       }
     }
 
-    // if queue is not empty,
     unsigned int idx=0;
-    
-    if (cur_idx) {
+    {
+      // Find highest target_idx value
       std::lock_guard<std::mutex> lock(mu_);
       queue_.ResetCursor();
-      for (int i = queue_.Size();i>0;i--) {
-        idx = max_(idx, queue_.RequestAtCursor_());
+      for(int i = queue_.Size();i>0;i--) {
+        idx = max_(idx, queue_.RequestAtCursor()->target_idx);
+        queue_.AdvanceCursor();
       }
     }
 
-    if (cur_idx>idx+2) {
-      std::lock_guard<std::mutex> lock(clock_);
-      cur_idx--;//idx;
-
-      nvmlDeviceSetGpuLockedClocks(sched_device[runner_id],
-                                    clist_[cur_idx], clist_[cur_idx]);
+    // Decrease GPU clock when queue is not empty
+    if (cur_idx>idx && idx!=0){
+      cur_idx=idx;
+      std::thread thread_(LockedClocks, sched_device[0], clist_[idx]);
+      thread_.detach();
     }
 
     // FIXME, this isn't really true anymore so needs to be revisited.
