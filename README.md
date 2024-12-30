@@ -5,7 +5,7 @@ This is the artifact repository for the HPCA'23 paper "Know Your Enemy To Save C
 ## Contents
 ![](./note/Contents.png)
 ### Prototype Server
-The prototype inference server is based on the Triton Inference Server ([TIS](https://github.com/triton-inference-server/server)). The source code is available [here](https://github.com/EMDC-OS/power-aware-triton/tree/main/src).
+The prototype inference server is based on the Triton Inference Server v2.7.0 ([TIS](https://github.com/triton-inference-server/server/tree/v2.7.0)). The source code is available [here](https://github.com/EMDC-OS/power-aware-triton/tree/main/src).
 
 ### Cloud-scale Simulation 
 The simulation was performed based on the values obtained from the prototype to observe the effectiveness of the proposed schemes in the cloud-scale environment.
