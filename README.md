@@ -1,10 +1,11 @@
-# Know Your Enemy To Save Cloud Energy: Energy-Performance Characterization of Machine Learning Serving
+# Know Your Enemy To Save Cloud Energy:<br>Energy-Performance Characterization of Machine Learning Serving
 
 This is the artifact repository for the HPCA'23 paper "Know Your Enemy To Save Cloud Energy: Energy-Performance Characterization of Machine Learning Serving". The prototype and the simulation code are available.
 
 ## Contents
-![](./misc/Contents.png)
-### Prototype Server
+<img src="./misc/Contents.png" alt="Contents" width="500"/>
+
+### Prototype Inference Server
 The prototype inference server is based on the Triton Inference Server v2.7.0 ([TIS](https://github.com/triton-inference-server/server/tree/v2.7.0)). The source code is available [here](https://github.com/EMDC-OS/power-aware-triton/tree/main/src).
 
 ### Cloud-scale Simulation 
